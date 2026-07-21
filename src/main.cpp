@@ -4,8 +4,9 @@
 #include <AsyncJson.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
-#include <U8g2lib.h>
+#include <TFT_eSPI.h>
 #include <Wire.h>
+#include "PCF8574.h"
 #include "AudioKitHAL.h"
 #include "Audio.h"
 #include "config.h"
@@ -16,9 +17,11 @@ Audio audio;
 AsyncWebServer server(80);
 
 // --- Display ---
-// 2.23" OLED is often SSD1305. We use a generic SSD1306/SSD1305 constructor for now.
-// I2C pins for ESP32-Audio-Kit are usually SDA=33, SCL=32
-U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ 32, /* data=*/ 33);
+TFT_eSPI tft = TFT_eSPI(); // Pins are defined in platformio.ini
+
+// --- Button Input (PCF8574 on I2C) ---
+PCF8574 pcf(0x20);
+bool pcfConnected = false;
 
 // --- Station Management ---
 #define MAX_STATIONS 10
@@ -27,8 +30,7 @@ String stationNames[MAX_STATIONS];
 int currentStation = 0;
 String currentTitle = "";
 
-// --- Button Input (Resistor Ladder on GPIO 34) ---
-#define BUTTON_PIN 34
+// #define BUTTON_PIN 34 (No longer used)
 unsigned long lastButtonPress = 0;
 
 void loadStations() {
@@ -83,35 +85,74 @@ void playStation(int index) {
     Serial.printf("Playing: %s\n", stationNames[index].c_str());
     
     // Update Display
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_helvB10_tf);
-    u8g2.drawStr(0, 12, stationNames[index].c_str());
-    u8g2.sendBuffer();
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK); // Retro Amber Look
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.print(stationNames[index]);
   }
 }
 
 void checkButtons() {
+  if (!pcfConnected) return; // Skip if no hardware connected
+  
   if (millis() - lastButtonPress < 300) return; // Debounce
 
-  int adcVal = analogRead(BUTTON_PIN);
-  if (adcVal > 100) { // Assuming 0 is nothing pressed (pulldown), or adjust logic if pullup
-    // TODO: Map ADC values to buttons 0-9
-    // Example placeholder thresholds:
-    int btn = -1;
-    if (adcVal > 4000) btn = 1;
-    else if (adcVal > 3500) btn = 2;
-    else if (adcVal > 3000) btn = 3;
-    else if (adcVal > 2500) btn = 4;
-    else if (adcVal > 2000) btn = 5;
-    else if (adcVal > 1500) btn = 6;
-    else if (adcVal > 1000) btn = 7;
-    else if (adcVal > 500) btn = 8;
+  int pressedBtn = -1;
+
+  // We scan the 4 columns (P0, P1, P2, P3).
+  // The rows (P4, P5, P6) are configured as inputs.
+  // Because diodes point from Switch to Row, we pull the Row LOW and drive Column HIGH.
+  // Actually, PCF8574 has weak pull-ups.
+  // We write 0 to one Row at a time to sink current, and read the Columns.
+  
+  // Make sure all columns are inputs with pullups (write 1)
+  uint8_t writeState = 0xFF; // All HIGH
+  
+  for (int row = 0; row < 3; row++) {
+    int rowPin = row + 4; // P4, P5, P6
     
-    if (btn != -1) {
-      Serial.printf("Button %d pressed (ADC: %d)\n", btn, adcVal);
-      playStation(btn - 1);
-      lastButtonPress = millis();
+    // Pull the current row LOW
+    writeState &= ~(1 << rowPin);
+    pcf.write8(writeState);
+    
+    // Small delay for PCF8574 to settle
+    delayMicroseconds(100);
+    
+    // Read columns (P0 to P3)
+    uint8_t readVal = pcf.read8();
+    
+    // If a button is pressed, the column (P0-P3) will be pulled LOW by the Row
+    if ((readVal & (1 << 0)) == 0) { // Col 0 (Pin 1)
+      if (row == 0) pressedBtn = 4; // R1
+      if (row == 1) pressedBtn = 8; // R2
     }
+    if ((readVal & (1 << 1)) == 0) { // Col 1 (Pin 5)
+      if (row == 0) pressedBtn = 1;
+      if (row == 1) pressedBtn = 5;
+      if (row == 2) pressedBtn = 9;
+    }
+    if ((readVal & (1 << 2)) == 0) { // Col 2 (Pin 6)
+      if (row == 0) pressedBtn = 2;
+      if (row == 1) pressedBtn = 6;
+      if (row == 2) pressedBtn = 0;
+    }
+    if ((readVal & (1 << 3)) == 0) { // Col 3 (Pin 7)
+      if (row == 0) pressedBtn = 3;
+      if (row == 1) pressedBtn = 7;
+      // row 2 is Store (ignore)
+    }
+    
+    // Restore the row HIGH
+    writeState |= (1 << rowPin);
+    pcf.write8(writeState);
+  }
+
+  if (pressedBtn != -1) {
+    int index = (pressedBtn == 0) ? 9 : pressedBtn - 1; // Map 1-9 to 0-8, 0 to 9
+    Serial.printf("Button %d pressed (Index: %d)\n", pressedBtn, index);
+    playStation(index);
+    lastButtonPress = millis();
   }
 }
 
@@ -155,6 +196,27 @@ void setupWebserver() {
   
   server.addHandler(handler);
 
+  AsyncCallbackJsonWebHandler *playHandler = new AsyncCallbackJsonWebHandler("/api/play", [](AsyncWebServerRequest *request, JsonVariant &json) {
+    JsonObject jsonObj = json.as<JsonObject>();
+    int index = jsonObj["index"].as<int>();
+    playStation(index);
+    request->send(200, "application/json", "{\"status\":\"success\"}");
+  });
+  server.addHandler(playHandler);
+
+  server.on("/api/stop", HTTP_POST, [](AsyncWebServerRequest *request){
+    audio.stopSong();
+    
+    // Update Display
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.print("Radio gestoppt");
+    
+    request->send(200, "application/json", "{\"status\":\"success\"}");
+  });
+
   server.begin();
 }
 
@@ -166,13 +228,23 @@ void setup() {
     return;
   }
   
-  // Init Display
+  // Init Display & I2C
   Wire.begin(33, 32); // SDA=33, SCL=32 for Audio Kit
-  u8g2.begin();
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0,10,"Booting...");
-  u8g2.sendBuffer();
+  
+  pcfConnected = pcf.begin();
+  if (pcfConnected) {
+    pcf.write8(0xFF); // Initialize PCF pins as HIGH (weak pull-up)
+  } else {
+    Serial.println("PCF8574 nicht gefunden! Tastenmatrix deaktiviert.");
+  }
+  
+  tft.init();
+  tft.setRotation(1); // Landscape
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.print("Booting...");
 
   // Init AudioKit HAL (Codec)
   auto cfg = kit.defaultConfig();
@@ -222,8 +294,9 @@ void setup() {
       // Fallback
       WiFi.begin(wifi_ssid, wifi_password);
   }
-  u8g2.drawStr(0, 25, "WiFi connecting...");
-  u8g2.sendBuffer();
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(10, 10);
+  tft.print("WiFi connecting...");
   
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -233,11 +306,11 @@ void setup() {
   Serial.println("\nWiFi connected");
   Serial.println(WiFi.localIP());
   
-  u8g2.clearBuffer();
-  u8g2.drawStr(0, 10, "WiFi Connected");
-  u8g2.setCursor(0, 25);
-  u8g2.print(WiFi.localIP());
-  u8g2.sendBuffer();
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(10, 10);
+  tft.print("WiFi Connected");
+  tft.setCursor(10, 35);
+  tft.print(WiFi.localIP().toString());
   
   loadStations();
   setupWebserver();
@@ -248,7 +321,7 @@ void setup() {
 
 void loop() {
   audio.loop();
-  // checkButtons(); // Temporarily disabled until physical buttons are wired
+  checkButtons(); // Matrix scanning active!
   
   // Process AudioKit keys (optional)
   // kit.processActions(); // Removed due to API change, we handle buttons manually
@@ -266,11 +339,13 @@ void audio_showstreamtitle(const char *info){
     currentTitle = String(info);
     
     // Update Display
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_helvB10_tf);
-    u8g2.drawStr(0, 12, stationNames[currentStation].c_str());
-    u8g2.setFont(u8g2_font_6x10_tf);
-    // Scroll logic or simple display for title
-    u8g2.drawStr(0, 28, currentTitle.substring(0, 20).c_str());
-    u8g2.sendBuffer();
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.print(stationNames[currentStation]);
+    
+    tft.setTextSize(1);
+    tft.setCursor(10, 40);
+    tft.print(currentTitle.substring(0, 40)); // Show up to 40 chars
 }

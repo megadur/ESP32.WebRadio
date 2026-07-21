@@ -1,97 +1,110 @@
-document.addEventListener('DOMContentLoaded', () => {
-    const stationsList = document.getElementById('stationsList');
-    const saveBtn = document.getElementById('saveBtn');
-    const statusMessage = document.getElementById('statusMessage');
-    
-    // Number of preset buttons on the RT200
-    const MAX_STATIONS = 10;
-    
-    // Initialize empty form
-    function initForm(data) {
-        stationsList.innerHTML = '';
-        const stations = data.stations || [];
-        
-        for (let i = 0; i < MAX_STATIONS; i++) {
-            const station = stations[i] || { name: '', url: '' };
-            
-            const card = document.createElement('div');
-            card.className = 'station-card';
-            
-            card.innerHTML = `
-                <div class="station-num">${i}</div>
-                <div class="input-group">
-                    <label>Sendername</label>
-                    <input type="text" id="name_${i}" value="${station.name}" placeholder="z.B. SWR3">
-                </div>
-                <div class="input-group">
-                    <label>Stream-URL</label>
-                    <input type="url" id="url_${i}" value="${station.url}" placeholder="http://...">
-                </div>
-            `;
-            
-            stationsList.appendChild(card);
-        }
-    }
+let stationData = [];
 
-    // Fetch existing stations
-    function fetchStations() {
-        fetch('/api/stations')
-            .then(res => res.json())
-            .then(data => initForm(data))
-            .catch(err => {
-                console.error('Fehler beim Laden:', err);
-                initForm({ stations: [] }); // Fallback
-            });
-    }
-
-    // Save configurations
-    saveBtn.addEventListener('click', () => {
-        saveBtn.style.transform = 'scale(0.95)';
-        setTimeout(() => saveBtn.style.transform = 'none', 150);
-
-        const stations = [];
-        for (let i = 0; i < MAX_STATIONS; i++) {
-            const name = document.getElementById(`name_${i}`).value.trim();
-            const url = document.getElementById(`url_${i}`).value.trim();
-            if (name || url) {
-                stations.push({ name, url });
-            } else {
-                stations.push({ name: "", url: "" });
-            }
-        }
-
-        const data = { stations };
-
-        fetch('/api/stations', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(data)
-        })
-        .then(res => {
-            if (res.ok) {
-                showStatus('Konfiguration erfolgreich gespeichert!', '#00f2fe');
-            } else {
-                showStatus('Fehler beim Speichern!', '#ff4757');
-            }
-        })
-        .catch(err => {
-            console.error('Speicherfehler:', err);
-            showStatus('Verbindungsfehler!', '#ff4757');
-        });
-    });
-
-    function showStatus(msg, color) {
-        statusMessage.textContent = msg;
-        statusMessage.style.color = color;
-        statusMessage.classList.add('show');
-        
-        setTimeout(() => {
-            statusMessage.classList.remove('show');
-        }, 3000);
-    }
-
-    // Initial load
+document.addEventListener("DOMContentLoaded", () => {
     fetchStations();
 });
+
+async function fetchStations() {
+    try {
+        const response = await fetch('/api/stations');
+        if (!response.ok) throw new Error('Netzwerk-Fehler');
+        const data = await response.json();
+        stationData = data.stations || [];
+        renderGrid();
+    } catch (error) {
+        console.error('Fehler beim Laden der Sender:', error);
+        showStatus('Fehler beim Laden der Sender!', 'error');
+    }
+}
+
+function renderGrid() {
+    const grid = document.getElementById('stationGrid');
+    grid.innerHTML = '';
+
+    for (let i = 0; i < 10; i++) {
+        // Fallback if less than 10 stations exist
+        const station = stationData[i] || { name: "", url: "" };
+        
+        const card = document.createElement('div');
+        card.className = 'station-card';
+        card.innerHTML = `
+            <div class="card-header">
+                <h3>Station ${i + 1}</h3>
+                <button class="btn-play" onclick="playStation(${i})" title="Sofort abspielen">▶</button>
+            </div>
+            <div class="input-group">
+                <label>Sendername</label>
+                <input type="text" id="name_${i}" value="${station.name}" placeholder="z.B. SWR3">
+            </div>
+            <div class="input-group">
+                <label>Stream URL</label>
+                <input type="text" id="url_${i}" value="${station.url}" placeholder="http://...">
+            </div>
+        `;
+        grid.appendChild(card);
+    }
+}
+
+async function saveStations() {
+    const btn = document.getElementById('saveBtn');
+    btn.innerHTML = '⏳ Speichern...';
+    btn.disabled = true;
+
+    const newStations = [];
+    for (let i = 0; i < 10; i++) {
+        newStations.push({
+            name: document.getElementById(`name_${i}`).value.trim(),
+            url: document.getElementById(`url_${i}`).value.trim()
+        });
+    }
+
+    try {
+        const response = await fetch('/api/stations', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stations: newStations })
+        });
+
+        if (response.ok) {
+            showStatus('Sender erfolgreich gespeichert!', 'success');
+        } else {
+            throw new Error('Server-Fehler');
+        }
+    } catch (error) {
+        showStatus('Fehler beim Speichern!', 'error');
+    } finally {
+        btn.innerHTML = '💾 Sender speichern';
+        btn.disabled = false;
+    }
+}
+
+async function playStation(index) {
+    try {
+        await fetch('/api/play', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: index })
+        });
+        showStatus(`Station ${index+1} wird abgespielt...`, 'success');
+    } catch (error) {
+        showStatus('Fehler beim Abspielen!', 'error');
+    }
+}
+
+async function stopRadio() {
+    try {
+        await fetch('/api/stop', { method: 'POST' });
+        showStatus('Radio gestoppt', 'success');
+    } catch (error) {
+        showStatus('Fehler beim Stoppen!', 'error');
+    }
+}
+
+function showStatus(text, type) {
+    const msg = document.getElementById('statusMsg');
+    msg.textContent = text;
+    msg.className = 'status-message show status-' + type;
+    setTimeout(() => {
+        msg.className = 'status-message status-' + type;
+    }, 3000);
+}
