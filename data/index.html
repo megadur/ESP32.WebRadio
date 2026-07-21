@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telefunken RT200 Webradio</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=Outfit:wght@500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-animation"></div>
+    <div class="container glass-panel">
+        <header>
+            <h1 class="gradient-text">Telefunken RT200</h1>
+            <p class="subtitle">Digital Audio Receiver</p>
+        </header>
+
+        <main>
+            <div class="stations-list" id="stationsList">
+                <!-- Stations will be injected here via JS -->
+            </div>
+
+            <button id="saveBtn" class="btn-primary">
+                <span class="btn-text">Konfiguration Speichern</span>
+                <div class="btn-glow"></div>
+            </button>
+            <div id="statusMessage" class="status-message"></div>
+        </main>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
