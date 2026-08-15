@@ -2,26 +2,36 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
-#include <ArduinoJson.h>
 #include <LittleFS.h>
-#include <TFT_eSPI.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
-#include "PCF8574.h"
-#include "AudioKitHAL.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include "Audio.h"
 #include "config.h"
 
+// --- Hardware Config ---
+#define USE_DISPLAY 0 // Set to 1 when the OLED is connected!
+
 // --- Audio & Web ---
-AudioKit kit;
 Audio audio;
 AsyncWebServer server(80);
 
 // --- Display ---
-TFT_eSPI tft = TFT_eSPI(); // Pins are defined in platformio.ini
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1 
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// --- Button Input (PCF8574 on I2C) ---
-PCF8574 pcf(0x20);
-bool pcfConnected = false;
+// --- Button Input ---
+// Pins for the 4 OLED buttons on NodeMCU (ESP32)
+#define BTN_K1 32 // Prev
+#define BTN_K2 33 // Next
+#define BTN_K3 13 // Vol -
+#define BTN_K4 14 // Vol +
+
+unsigned long lastButtonPress = 0;
+const int debounceDelay = 300;
 
 // --- Station Management ---
 #define MAX_STATIONS 10
@@ -29,15 +39,47 @@ String stations[MAX_STATIONS];
 String stationNames[MAX_STATIONS];
 int currentStation = 0;
 String currentTitle = "";
+int currentVolume = 15;
 
-// #define BUTTON_PIN 34 (No longer used)
-unsigned long lastButtonPress = 0;
+void updateDisplay(String status = "") {
+#if USE_DISPLAY
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  
+  if (status.length() > 0) {
+    // Show status message (e.g., Booting, WiFi...)
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.println(status);
+  } else {
+    // Top Bar: Volume
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.printf("Vol: %d", currentVolume);
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    
+    // Station Name
+    display.setTextSize(2);
+    display.setCursor(0, 15);
+    display.println(stationNames[currentStation].substring(0, 10)); // Truncate if too long
+    
+    // Stream Title
+    display.setTextSize(1);
+    display.setCursor(0, 35);
+    display.println(currentTitle.substring(0, 21)); 
+    if(currentTitle.length() > 21) {
+      display.println(currentTitle.substring(21, 42));
+    }
+  }
+  display.display();
+#endif
+}
 
 void loadStations() {
   if (!LittleFS.exists("/stations.json")) {
     Serial.println("No stations.json found, using defaults");
     stationNames[0] = "SWR3";
-    stations[0] = "https://liveradio.swr.de/sw282p3/swr3/play.mp3";
+    stations[0] = "http://liveradio.swr.de/sw282p3/swr3/play.mp3"; // HTTP instead of HTTPS to save CPU on C3
     stationNames[1] = "1LIVE";
     stations[1] = "http://wdr-1live-live.icecast.wdr.de/wdr/1live/live/mp3/128/stream.mp3";
     return;
@@ -48,15 +90,12 @@ void loadStations() {
   DeserializationError error = deserializeJson(doc, file);
   file.close();
 
-  if (error) {
-    Serial.println("Failed to parse stations.json");
-    return;
-  }
-
-  JsonArray array = doc["stations"].as<JsonArray>();
-  for (int i = 0; i < MAX_STATIONS && i < array.size(); i++) {
-    stationNames[i] = array[i]["name"].as<String>();
-    stations[i] = array[i]["url"].as<String>();
+  if (!error) {
+    JsonArray array = doc["stations"].as<JsonArray>();
+    for (int i = 0; i < MAX_STATIONS && i < array.size(); i++) {
+      stationNames[i] = array[i]["name"].as<String>();
+      stations[i] = array[i]["url"].as<String>();
+    }
   }
 }
 
@@ -83,77 +122,39 @@ void playStation(int index) {
     currentTitle = "";
     audio.connecttohost(stations[index].c_str());
     Serial.printf("Playing: %s\n", stationNames[index].c_str());
-    
-    // Update Display
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK); // Retro Amber Look
-    tft.setTextSize(2);
-    tft.setCursor(10, 10);
-    tft.print(stationNames[index]);
+    updateDisplay();
   }
 }
 
 void checkButtons() {
-  if (!pcfConnected) return; // Skip if no hardware connected
-  
-  if (millis() - lastButtonPress < 300) return; // Debounce
+#if USE_DISPLAY
+  if (millis() - lastButtonPress < debounceDelay) return;
 
-  int pressedBtn = -1;
-
-  // We scan the 4 columns (P0, P1, P2, P3).
-  // The rows (P4, P5, P6) are configured as inputs.
-  // Because diodes point from Switch to Row, we pull the Row LOW and drive Column HIGH.
-  // Actually, PCF8574 has weak pull-ups.
-  // We write 0 to one Row at a time to sink current, and read the Columns.
-  
-  // Make sure all columns are inputs with pullups (write 1)
-  uint8_t writeState = 0xFF; // All HIGH
-  
-  for (int row = 0; row < 3; row++) {
-    int rowPin = row + 4; // P4, P5, P6
-    
-    // Pull the current row LOW
-    writeState &= ~(1 << rowPin);
-    pcf.write8(writeState);
-    
-    // Small delay for PCF8574 to settle
-    delayMicroseconds(100);
-    
-    // Read columns (P0 to P3)
-    uint8_t readVal = pcf.read8();
-    
-    // If a button is pressed, the column (P0-P3) will be pulled LOW by the Row
-    if ((readVal & (1 << 0)) == 0) { // Col 0 (Pin 1)
-      if (row == 0) pressedBtn = 4; // R1
-      if (row == 1) pressedBtn = 8; // R2
-    }
-    if ((readVal & (1 << 1)) == 0) { // Col 1 (Pin 5)
-      if (row == 0) pressedBtn = 1;
-      if (row == 1) pressedBtn = 5;
-      if (row == 2) pressedBtn = 9;
-    }
-    if ((readVal & (1 << 2)) == 0) { // Col 2 (Pin 6)
-      if (row == 0) pressedBtn = 2;
-      if (row == 1) pressedBtn = 6;
-      if (row == 2) pressedBtn = 0;
-    }
-    if ((readVal & (1 << 3)) == 0) { // Col 3 (Pin 7)
-      if (row == 0) pressedBtn = 3;
-      if (row == 1) pressedBtn = 7;
-      // row 2 is Store (ignore)
-    }
-    
-    // Restore the row HIGH
-    writeState |= (1 << rowPin);
-    pcf.write8(writeState);
-  }
-
-  if (pressedBtn != -1) {
-    int index = (pressedBtn == 0) ? 9 : pressedBtn - 1; // Map 1-9 to 0-8, 0 to 9
-    Serial.printf("Button %d pressed (Index: %d)\n", pressedBtn, index);
-    playStation(index);
+  if (digitalRead(BTN_K1) == LOW) {
+    int newStation = currentStation - 1;
+    if (newStation < 0) newStation = 0;
+    playStation(newStation);
+    lastButtonPress = millis();
+  } 
+  else if (digitalRead(BTN_K2) == LOW) {
+    int newStation = currentStation + 1;
+    if (newStation >= MAX_STATIONS || stations[newStation].length() == 0) newStation = currentStation;
+    playStation(newStation);
     lastButtonPress = millis();
   }
+  else if (digitalRead(BTN_K3) == LOW) {
+    if(currentVolume > 0) currentVolume--;
+    audio.setVolume(currentVolume);
+    updateDisplay();
+    lastButtonPress = millis();
+  }
+  else if (digitalRead(BTN_K4) == LOW) {
+    if(currentVolume < 21) currentVolume++;
+    audio.setVolume(currentVolume);
+    updateDisplay();
+    lastButtonPress = millis();
+  }
+#endif
 }
 
 void setupWebserver() {
@@ -193,7 +194,6 @@ void setupWebserver() {
     saveStations();
     request->send(200, "application/json", "{\"status\":\"success\"}");
   });
-  
   server.addHandler(handler);
 
   AsyncCallbackJsonWebHandler *playHandler = new AsyncCallbackJsonWebHandler("/api/play", [](AsyncWebServerRequest *request, JsonVariant &json) {
@@ -203,17 +203,10 @@ void setupWebserver() {
     request->send(200, "application/json", "{\"status\":\"success\"}");
   });
   server.addHandler(playHandler);
-
+  
   server.on("/api/stop", HTTP_POST, [](AsyncWebServerRequest *request){
     audio.stopSong();
-    
-    // Update Display
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.setCursor(10, 10);
-    tft.print("Radio gestoppt");
-    
+    updateDisplay("Stopped");
     request->send(200, "application/json", "{\"status\":\"success\"}");
   });
 
@@ -224,93 +217,77 @@ void setup() {
   Serial.begin(115200);
   
   if (!LittleFS.begin(true)) {
-    Serial.println("An Error has occurred while mounting LittleFS");
-    return;
+    Serial.println("LittleFS Mount Failed");
   }
   
-  // Init Display & I2C
-  Wire.begin(33, 32); // SDA=33, SCL=32 for Audio Kit
+  // LÖSCHE ALTE KONFIGURATION UM HTTP ZU ERZWINGEN (Behebt evtl. Stottern durch HTTPS-Overhead)
+  LittleFS.remove("/stations.json");
   
-  pcfConnected = pcf.begin();
-  if (pcfConnected) {
-    pcf.write8(0xFF); // Initialize PCF pins as HIGH (weak pull-up)
-  } else {
-    Serial.println("PCF8574 nicht gefunden! Tastenmatrix deaktiviert.");
+  // Init Buttons
+#if USE_DISPLAY
+  pinMode(BTN_K1, INPUT_PULLUP);
+  pinMode(BTN_K2, INPUT_PULLUP);
+  pinMode(BTN_K3, INPUT_PULLUP);
+  pinMode(BTN_K4, INPUT_PULLUP);
+  
+  // Init I2C & OLED
+  Wire.begin(21, 22); 
+  Wire.setClock(100000); 
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("SSD1306 allocation failed"));
   }
-  
-  tft.init();
-  tft.setRotation(1); // Landscape
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(10, 10);
-  tft.print("Booting...");
+  display.clearDisplay();
+  display.display();
+#endif
+  updateDisplay("Booting...");
 
-  // Init AudioKit HAL (Codec)
-  auto cfg = kit.defaultConfig();
-  cfg.i2s_active = false; // We let ESP32-audioI2S handle the I2S driver!
-  kit.begin(cfg);
+  // Audio configuration for ESP32-S3
+  // BCLK=3, LRC=1, DIN=2, MCLK nicht verwendet.
+  // Da SCK an Pin 4 gelötet ist, ziehen wir ihn per Software auf GND (LOW):
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
   
-  // Audio configuration
-  audio.setPinout(27, 25, 26, 0); // Ai-Thinker A1S needs BCLK, LRC, DOUT and MCLK on GPIO 0!
-  audio.setVolume(15); 
+  audio.setPinout(3, 1, 2); 
+  
+  audio.setVolume(currentVolume);
   
   // WiFi
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname("WebRadio");
+  WiFi.setSleep(false); // VERHINDERT VERBINDUNGSABBRÜCHE (Errno 113) BEIM STREAMING
   WiFi.disconnect(true);
   delay(100);
   
-  Serial.println("\n--- Starte WLAN-Scan ---");
   int n = WiFi.scanNetworks();
   int targetNetwork = -1;
   int bestRSSI = -1000;
   
-  if (n == 0) {
-      Serial.println("Keine Netzwerke gefunden!");
-  } else {
-      Serial.printf("%d Netzwerke gefunden:\n", n);
-      for (int i = 0; i < n; ++i) {
-          Serial.printf("%2d: %s (%d dBm)\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i));
-          
-          // Suche das stärkste Netz mit dem passenden Namen
-          if (WiFi.SSID(i) == String(wifi_ssid)) {
-              if (WiFi.RSSI(i) > bestRSSI) {
-                  bestRSSI = WiFi.RSSI(i);
-                  targetNetwork = i;
-              }
+  for (int i = 0; i < n; ++i) {
+      if (WiFi.SSID(i) == String(wifi_ssid)) {
+          if (WiFi.RSSI(i) > bestRSSI) {
+              bestRSSI = WiFi.RSSI(i);
+              targetNetwork = i;
           }
       }
   }
-  Serial.println("------------------------\n");
 
-  // Fix DNS issues by forcing a reliable DNS Server
-  IPAddress dns(8, 8, 8, 8); // Google DNS
+  IPAddress dns(8, 8, 8, 8);
   WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, dns);
 
   if (targetNetwork >= 0) {
-      Serial.printf("Umgehe Band-Steering! Verbinde gezielt mit BSSID von %s\n", WiFi.SSID(targetNetwork).c_str());
       WiFi.begin(wifi_ssid, wifi_password, 0, WiFi.BSSID(targetNetwork));
   } else {
-      // Fallback
       WiFi.begin(wifi_ssid, wifi_password);
   }
-  tft.fillScreen(TFT_BLACK);
-  tft.setCursor(10, 10);
-  tft.print("WiFi connecting...");
+  
+  updateDisplay("WiFi connecting...");
   
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
   }
   
-  Serial.println("\nWiFi connected");
-  Serial.println(WiFi.localIP());
-  
-  tft.fillScreen(TFT_BLACK);
-  tft.setCursor(10, 10);
-  tft.print("WiFi Connected");
-  tft.setCursor(10, 35);
-  tft.print(WiFi.localIP().toString());
+  updateDisplay("WiFi Connected!\n" + WiFi.localIP().toString());
   
   loadStations();
   setupWebserver();
@@ -321,31 +298,15 @@ void setup() {
 
 void loop() {
   audio.loop();
-  checkButtons(); // Matrix scanning active!
-  
-  // Process AudioKit keys (optional)
-  // kit.processActions(); // Removed due to API change, we handle buttons manually
+  checkButtons();
 }
 
-// Optional Audio callbacks
 void audio_showstation(const char *info){
     Serial.print("station_info: ");
     Serial.println(info);
 }
 
 void audio_showstreamtitle(const char *info){
-    Serial.print("streamtitle: ");
-    Serial.println(info);
     currentTitle = String(info);
-    
-    // Update Display
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.setCursor(10, 10);
-    tft.print(stationNames[currentStation]);
-    
-    tft.setTextSize(1);
-    tft.setCursor(10, 40);
-    tft.print(currentTitle.substring(0, 40)); // Show up to 40 chars
+    updateDisplay();
 }

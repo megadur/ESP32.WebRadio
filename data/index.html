@@ -11,9 +11,10 @@
     <div class="background-animation"></div>
     
     <div class="container">
-        <header>
+        <header style="position: relative;">
             <h1>TELEFUNKEN <span>RT200</span></h1>
             <p class="subtitle">Digital Tuner Configuration</p>
+            <button id="stopBtn" class="btn-secondary" onclick="stopRadio()" style="position: absolute; top: 10px; right: 10px;">⏹ Stop</button>
         </header>
 
         <div class="station-grid" id="stationGrid">
@@ -22,7 +23,6 @@
 
         <div class="save-container">
             <button id="saveBtn" class="btn-primary" onclick="saveStations()">💾 Sender speichern</button>
-            <button id="stopBtn" class="btn-secondary" onclick="stopRadio()">⏹ Stop</button>
             <div id="statusMsg" class="status-message"></div>
         </div>
     </div>
