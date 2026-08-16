@@ -11,7 +11,7 @@
 #include "config.h"
 
 // --- Hardware Config ---
-#define USE_DISPLAY 0 // Set to 1 when the OLED is connected!
+#define USE_DISPLAY 1 // Set to 1 when the OLED is connected!
 
 // --- Audio & Web ---
 Audio audio;
@@ -24,11 +24,11 @@ AsyncWebServer server(80);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // --- Button Input ---
-// Pins for the 4 OLED buttons on NodeMCU (ESP32)
-#define BTN_K1 32 // Prev
-#define BTN_K2 33 // Next
-#define BTN_K3 13 // Vol -
-#define BTN_K4 14 // Vol +
+// Pins for the 4 OLED buttons on ESP32-S3
+#define BTN_K1 12 // Prev
+#define BTN_K2 11 // Next
+#define BTN_K3 10 // Vol +
+#define BTN_K4 9  // Vol -
 
 unsigned long lastButtonPress = 0;
 const int debounceDelay = 300;
@@ -43,27 +43,24 @@ int currentVolume = 15;
 
 void updateDisplay(String status = "") {
 #if USE_DISPLAY
+  Serial.println("updateDisplay started");
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   
   if (status.length() > 0) {
-    // Show status message (e.g., Booting, WiFi...)
     display.setTextSize(1);
     display.setCursor(0, 20);
     display.println(status);
   } else {
-    // Top Bar: Volume
     display.setTextSize(1);
     display.setCursor(0, 0);
     display.printf("Vol: %d", currentVolume);
     display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
     
-    // Station Name
     display.setTextSize(2);
     display.setCursor(0, 15);
-    display.println(stationNames[currentStation].substring(0, 10)); // Truncate if too long
+    display.println(stationNames[currentStation].substring(0, 10)); 
     
-    // Stream Title
     display.setTextSize(1);
     display.setCursor(0, 35);
     display.println(currentTitle.substring(0, 21)); 
@@ -71,7 +68,9 @@ void updateDisplay(String status = "") {
       display.println(currentTitle.substring(21, 42));
     }
   }
+  Serial.println("Calling display.display()...");
   display.display();
+  Serial.println("updateDisplay finished");
 #endif
 }
 
@@ -143,13 +142,13 @@ void checkButtons() {
     lastButtonPress = millis();
   }
   else if (digitalRead(BTN_K3) == LOW) {
-    if(currentVolume > 0) currentVolume--;
+    if(currentVolume < 21) currentVolume++;
     audio.setVolume(currentVolume);
     updateDisplay();
     lastButtonPress = millis();
   }
   else if (digitalRead(BTN_K4) == LOW) {
-    if(currentVolume < 21) currentVolume++;
+    if(currentVolume > 0) currentVolume--;
     audio.setVolume(currentVolume);
     updateDisplay();
     lastButtonPress = millis();
@@ -220,9 +219,6 @@ void setup() {
     Serial.println("LittleFS Mount Failed");
   }
   
-  // LÖSCHE ALTE KONFIGURATION UM HTTP ZU ERZWINGEN (Behebt evtl. Stottern durch HTTPS-Overhead)
-  LittleFS.remove("/stations.json");
-  
   // Init Buttons
 #if USE_DISPLAY
   pinMode(BTN_K1, INPUT_PULLUP);
@@ -230,11 +226,12 @@ void setup() {
   pinMode(BTN_K3, INPUT_PULLUP);
   pinMode(BTN_K4, INPUT_PULLUP);
   
-  // Init I2C & OLED
-  Wire.begin(21, 22); 
+  // Init I2C & OLED (SDA=8, SCL=7)
+  Wire.begin(8, 7); 
   Wire.setClock(100000); 
+  Wire.setTimeOut(100); // Prevent I2C from hanging the ESP32
   
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed"));
   }
   display.clearDisplay();
